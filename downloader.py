@@ -7,12 +7,15 @@ them sequentially inside a worker thread (so the UI stays responsive):
   chapters were ticked, or a single full-video job otherwise.  File names
   follow ``NN [time-code] Title [ID].mp4`` and are sanitised; playlist
   downloads go into ``<catalogue>/<playlist name>/``.
-* :class:`Downloader` executes the jobs with yt-dlp.  Chapters are cut via the
-  CLI-equivalent of ``--download-sections "*start-end"`` — implemented as the
-  documented ``download_ranges`` callback plus a per-chapter ``outtmpl``, which
-  makes yt-dlp fetch only the requested byte ranges / HLS-DASH fragments
-  (``section_start``/``section_end``) instead of the whole file.  The result is
-  muxed/remuxed to ``mp4`` (or converted to ``mp3`` for audio-only).
+* :class:`Downloader` executes the jobs with yt-dlp.  All chapters of one
+  video are fetched by a **single** yt-dlp run, exactly like several
+  ``--download-sections "*start-end"`` options on the command line: the
+  documented ``download_ranges`` callback yields every chapter range at once,
+  yt-dlp sets ``section_start``/``section_end`` per split entry and downloads
+  only that part (HTTP byte ranges / matching DASH-HLS segments), while the
+  ``section_title``/``section_number`` output template keeps the pieces in
+  separate files.  Each piece is muxed/remuxed to ``mp4`` (or converted to
+  ``mp3`` for audio-only).
 * The one format chosen by the user applies to the entire batch; when a video
   does not offer that exact resolution the nearest available height is used
   and the substitution is written to the log.
@@ -264,25 +267,57 @@ class Downloader:
                 self._log(f"Не удалось создать каталог {directory}: {exc}")
 
     def _target_path(self, job: DownloadJob) -> Path:
+        """Expected final file for a full-video download."""
         suffix = ".mp3" if self._fmt.is_audio_only else ".mp4"
         return job.output_dir / f"{job.basename}{suffix}"
 
-    def _section_target_path(self, job: DownloadJob, number: int) -> Path:
-        """Expected file for chapter *number* of ``job`` (yt-dlp appends the
-        section index because several chapters share one YoutubeDL run)."""
-        suffix = ".mp3" if self._fmt.is_audio_only else ".mp4"
-        return job.output_dir / f"{job.basename} {number}{suffix}"
+    def _expected_path(self, job: DownloadJob) -> Path:
+        """Expected final file of *job*, chapter-aware.
 
-    def _existing_output(self, job: DownloadJob, expected: Path) -> bool:
-        """``True`` when a finished file for this job is already on disk."""
+        For chapters the name mirrors the group ``outtmpl``: the stem of the
+        video's first chapter plus the sanitised section title in brackets —
+        e.g. ``01 [00-00] Intro [vidAAA] [Intro].mp4``.  yt-dlp fills
+        ``%(section_title)s`` from the range's ``title``, so every piece maps
+        back to exactly one :class:`DownloadJob`.
+        """
+        suffix = ".mp3" if self._fmt.is_audio_only else ".mp4"
+        if job.fragment is None:
+            return self._target_path(job)
+        return job.output_dir / f"{self._chapter_stem(job)}{suffix}"
+
+    def _expected_paths(self, group: list[DownloadJob]) -> list[Path]:
+        """One expected output file per job of the group, in job order."""
+        return [self._expected_path(job) for job in group]
+
+    @staticmethod
+    def _chapter_stem(job: DownloadJob) -> str:
+        """File-name stem of one chapter, mirroring the ``outtmpl`` used.
+
+        ``%(section_title)s`` is filled from the range's ``title``, which we
+        sanitise ourselves; the stem therefore matches yt-dlp's real output
+        even when two chapters share a title (yt-dlp then appends the section
+        number inside the brackets — handled by the glob in
+        :meth:`_find_output`).
+        """
+        assert job.fragment is not None
+        base = build_basename(job.video, job.fragment, job.position, job.videos_total)
+        stem = re.sub(r"\[[^\[\]]*\]\s*$", "", base).strip()
+        title = sanitize(job.fragment.title, _MAX_FRAGMENT_TITLE)
+        return f"{stem} [{title}]"
+
+    def _existing_output(self, expected: Path) -> bool:
+        """``True`` when a finished file for this path is already on disk."""
         if expected.exists():
             return True
         stem = expected.with_suffix("").name
         media = {".mp4", ".mp3", ".mkv", ".webm", ".m4a"}
+        directory = expected.parent
+        if not directory.is_dir():
+            return False
         return any(
             candidate.suffix.lower() in media
-            for candidate in job.output_dir.glob(f"{stem}*")
-        ) if job.output_dir.is_dir() else False
+            for candidate in directory.glob(f"{stem}*")
+        )
 
     def _format_selector(self, job: DownloadJob) -> str:
         """Map the globally chosen format onto this specific video.
@@ -317,19 +352,50 @@ class Downloader:
             {"key": "FFmpegMetadata"},
         ]
 
-    def _make_hook(self, job: DownloadJob) -> Callable[[dict], None]:
+    def _make_hook(
+        self, pending: list[tuple[DownloadJob, Path]]
+    ) -> Callable[[dict], None]:
         """Build a yt-dlp ``progress_hooks`` entry reporting to the UI.
 
         For chapter cuts yt-dlp reports the progress of the *cut piece* (only
         the requested byte range / fragments are fetched), so percentages are
-        relative to the fragment size, not to the full video.
+        relative to the fragment size, not to the full video.  The current
+        piece is recognised via its ``section_title``/``section_start``; for a
+        plain full-video download the only job of the group is used.
         """
+
+        def find_job(data: dict) -> DownloadJob:
+            title = data.get("section_title")
+            if title:
+                for job, _ in pending:
+                    if (
+                        job.fragment is not None
+                        and sanitize(job.fragment.title, _MAX_FRAGMENT_TITLE) == title
+                    ):
+                        return job
+            start = data.get("section_start")
+            end = data.get("section_end")
+            if start is not None:
+                for job, _ in pending:
+                    frag = job.fragment
+                    if frag is None:
+                        continue
+                    same_start = abs(frag.start - start) < 1.0
+                    same_end = (
+                        (end is None and frag.end is None)
+                        or (end is not None and frag.end is not None
+                            and abs(frag.end - end) < 1.0)
+                    )
+                    if same_start and same_end:
+                        return job
+            return pending[0][0]
 
         def hook(data: dict) -> None:
             if self.cancelled:
                 raise KeyboardInterrupt("Отменено пользователем")
             status = data.get("status")
             if status == "downloading":
+                job = find_job(data)
                 total = data.get("total_bytes") or data.get("total_bytes_estimate")
                 done = data.get("downloaded_bytes") or 0
                 percent = (done / total * 100.0) if total else 0.0
@@ -342,31 +408,50 @@ class Downloader:
                     text += f" · осталось ~{eta} с"
                 self._file_progress(job, percent, text)
             elif status == "finished":
-                self._file_progress(job, 100.0, "Обработка через ffmpeg…")
+                self._file_progress(find_job(data), 100.0, "Обработка через ffmpeg…")
 
         return hook
 
     # ------------------------------------------------------------ execution
-    def _run_job(self, job: DownloadJob, yt_dlp_module) -> str:
-        target = self._target_path(job)
-        if self._existing_output(job, target):
-            if not self._overwrite:
-                self._log(f"Файл уже существует, пропускаю: {target.name}")
-                return "skipped"
-            # Leftovers of an interrupted run would otherwise block the retry.
-            try:
-                target.unlink()
-            except OSError:
-                pass
+    def _run_group(self, group: list[DownloadJob], yt_dlp_module) -> list[str]:
+        """Fetch one video (whole or all its chapters) in a single yt-dlp run.
 
+        Every chapter of the video is passed to ``download_ranges`` at once —
+        exactly what several ``--download-sections "*start-end"`` options do on
+        the command line.  yt-dlp then splits the entry per range, sets
+        ``section_start``/``section_end`` and downloads **only** the requested
+        time ranges instead of the whole file.  Returns one status string per
+        job of *group* (``downloaded`` / ``skipped`` / ``failed``).
+        """
+        lead = group[0]
+        statuses: list[str] = []
+        pending: list[tuple[DownloadJob, Path]] = []
+        for job in group:
+            path = self._expected_path(job)
+            if self._existing_output(path):
+                if not self._overwrite:
+                    self._log(f"Файл уже существует, пропускаю: {path.name}")
+                    statuses.append("skipped")
+                    continue
+                # Leftovers of an interrupted run would otherwise block retry.
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            statuses.append("pending")
+            pending.append((job, path))
+        if not pending:
+            return statuses
+
+        cutting = any(job.fragment is not None for job, _ in pending)
         options: dict = {
-            "format": self._format_selector(job),
-            "paths": {"home": str(job.output_dir)},
+            "format": self._format_selector(lead),
+            "paths": {"home": str(lead.output_dir)},
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
             "ignoreerrors": False,
-            "progress_hooks": [self._make_hook(job)],
+            "progress_hooks": [self._make_hook(pending)],
             "postprocessors": self._postprocessors(),
             "socket_timeout": 30,
             "retries": 3,
@@ -377,44 +462,64 @@ class Downloader:
             options["overwrites"] = True
         if not self._fmt.is_audio_only:
             options["merge_output_format"] = "mp4"
-        if job.fragment is not None:
-            # Equivalent of the CLI ``--download-sections "*start-end"``.
-            # The Python API parameter is called ``download_ranges`` and must
-            # be a callback yielding the time ranges; passing a string under
-            # any name is silently ignored by YoutubeDL, which used to make us
-            # download the whole file instead of only the chapter.  With real
-            # ranges yt-dlp sets ``section_start``/``section_end`` and fetches
-            # only that part (HTTP byte ranges or matching DASH/HLS fragments).
-            end = job.fragment.end
-            options["download_ranges"] = _range_callback(job.fragment.start, end)
-            options["force_keyframes_at_cuts"] = True
-            # Every chapter of one video goes through a single YoutubeDL run,
-            # so the output template has to disambiguate them by section.
-            options["outtmpl"] = {
-                "default": f"{job.basename}.%(ext)s",
-                "section_number": f"{job.basename} %(section_number)s.%(ext)s",
-            }
-        else:
-            options["outtmpl"] = {"default": f"{job.basename}.%(ext)s"}
 
-        cutting = job.fragment is not None
-        self._log(
-            f"Скачиваю фрагменты (только выбранные тайм-коды): {job.label}"
-            if cutting else f"Скачиваю всё видео: {job.label}"
-        )
+        if cutting:
+            # CLI-equivalent of repeated --download-sections "*START-END".
+            # The Python API parameter is ``download_ranges`` and must be a
+            # callback yielding the time ranges; passing a string under any
+            # name is silently ignored by YoutubeDL, which made us download
+            # the whole file instead of only the selected chapters.
+            ranges = [
+                {
+                    "start": job.fragment.start,
+                    "end": job.fragment.end,
+                    "title": sanitize(job.fragment.title, _MAX_FRAGMENT_TITLE),
+                    "job": job,
+                }
+                for job, _ in pending
+                if job.fragment is not None
+            ]
+            options["download_ranges"] = _ranges_callback(ranges)
+            options["force_keyframes_at_cuts"] = True
+            # Output template mirrors the *first* chapter's expected name with
+            # the trailing ``[ID]`` replaced by ``[%(section_title)s]``, so
+            # yt-dlp writes every chapter into its own file named after that
+            # chapter (same scheme as the CLI ``--split-chapters``).
+            first_stem = self._chapter_stem(ranges[0]["job"])
+            options["outtmpl"] = {"default": f"{first_stem}.%(ext)s"}
+            self._log(
+                "Скачиваю только выбранные фрагменты "
+                f"(--download-sections-эквивалент): {lead.video.title} "
+                f"[{len(ranges)} фрагм.(ов)]"
+            )
+        else:
+            options["outtmpl"] = {"default": f"{lead.basename}.%(ext)s"}
+            self._log(f"Скачиваю всё видео: {lead.label}")
+
+        ok = True
         try:
             with yt_dlp_module.YoutubeDL(options) as ydl:
-                ydl.download([job.video.watch_url])
+                ydl.download([lead.video.watch_url])
         except KeyboardInterrupt:
             self._log("Текущая загрузка прервана.")
-            return "cancelled"
+            return ["cancelled" if status == "pending" else status
+                    for status in statuses]
         except Exception as exc:  # noqa: BLE001 - one bad video must not kill the batch
-            self._log(f"Ошибка на «{job.label}»: {_first_line(str(exc))}")
-            return "failed"
+            self._log(f"Ошибка на «{lead.video.title}»: {_first_line(str(exc))}")
+            ok = False
 
-        produced = self._find_output(job, target)
-        self._log(f"Сохранено: {produced or target}")
-        return "downloaded"
+        for position, (job, path) in enumerate(pending):
+            if not ok:
+                statuses[position] = "failed"
+                continue
+            produced = self._find_output(job, path)
+            if produced:
+                statuses[position] = "downloaded"
+                self._log(f"Сохранено: {produced}")
+            else:
+                statuses[position] = "failed"
+                self._log(f"Фрагмент не найден среди результатов: {path.name}")
+        return statuses
 
     def _find_output(self, job: DownloadJob, expected: Path) -> str | None:
         """Locate the real file, whose extension may differ from the guess."""
@@ -428,30 +533,32 @@ class Downloader:
         return None
 
 
-def _range_callback(start: int, end: int | None) -> Callable[[dict, object], list[dict]]:
+def _ranges_callback(
+    ranges: list[dict],
+) -> Callable[[dict, object], list[dict]]:
     """Build a ``download_ranges`` callback for one or several chapters.
 
-    Mirrors what the CLI does for ``--download-sections "*START-END"``:
-    yields ranges with ``start_time``/``end_time`` in seconds (a range may be
-    a ``(start, end)`` tuple as well).  An open ended chapter (``end`` of
+    Mirrors what the CLI does for repeated ``--download-sections
+    "*START-END"`` options (and ``--split-chapters`` naming): every entry of
+    *ranges* carries ``start``/``end`` in seconds plus the chapter ``title``,
+    which yt-dlp exposes to the output template as ``%(section_title)s`` and
+    to progress hooks as ``section_title``.  An open ended chapter (``end`` of
     ``None``) maps to ``inf``, i.e. "up to the end of the video".
     """
 
     def provider(_info_dict: dict, _ydl: object) -> list[dict]:
         return [
-            {"start_time": float(max(int(s), 0)),
-             "end_time": float(e) if e else float("inf")}
-            for s, e in _as_pairs(start, end)
+            {
+                "start_time": float(max(int(item["start"]), 0)),
+                "end_time": (
+                    float(item["end"]) if item.get("end") else float("inf")
+                ),
+                "title": item.get("title"),
+            }
+            for item in ranges
         ]
 
     return provider
-
-
-def _as_pairs(start: int, end: int | None) -> list[tuple[int, int | None]]:
-    """Normalise the callback arguments into ``[(start, end), ...]`` pairs."""
-    if isinstance(start, (list, tuple)):
-        return [(int(s), int(e) if e is not None else None) for s, e in start]
-    return [(int(start), int(end) if end is not None else None)]
 
 
 def human_size(size: float | None) -> str:
