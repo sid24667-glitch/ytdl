@@ -38,6 +38,9 @@ from timestamp_parser import fragments_or_whole_video
 #: Poll interval (ms) used to drain the worker -> UI message queue.
 _POLL_MS = 100
 
+#: Maximum number of lines kept in the journal window.
+_MAX_LOG_LINES = 800
+
 _CHECK_OFF = "☐"
 _CHECK_ON = "☑"
 _CHECK_ND = "◪"
@@ -277,9 +280,16 @@ class App(tk.Tk):
 
     # =================================================================== logging
     def log(self, message: str) -> None:
-        """Append a line to the journal (main thread only)."""
+        """Append a line to the journal (main thread only).
+
+        The journal is trimmed to ``_MAX_LOG_LINES`` lines so long batches
+        with ffmpeg chatter cannot grow it without bound.
+        """
         self.log_text.configure(state="normal")
         self.log_text.insert("end", message.rstrip() + "\n")
+        excess = int(self.log_text.index("end-1c").split(".")[0]) - _MAX_LOG_LINES
+        if excess > 0:
+            self.log_text.delete("1.0", f"{excess + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -332,6 +342,8 @@ class App(tk.Tk):
         elif kind == "video_progress":
             index, total, title = payload  # type: ignore[misc]
             self._overall(index - 1, total, f"Видео {index} из {total}")
+            self.file_bar.configure(value=0)
+            self.file_label.configure(text="—")
             self._set_status(f"Скачиваю: {title}")
         elif kind == "file_progress":
             job, percent, text = payload  # type: ignore[misc]
@@ -339,6 +351,9 @@ class App(tk.Tk):
         elif kind == "job_done":
             job, status = payload  # type: ignore[misc]
             self._set_status(f"{status}: {job.basename}")
+            # Keep the overall bar moving even when a job produced no hook
+            # callbacks (e.g. it was skipped or failed before downloading).
+            self._advance_overall(job)
         elif kind == "done":
             self._overall_complete()
             self._set_busy(False)
@@ -719,25 +734,56 @@ class App(tk.Tk):
         self.file_bar.configure(value=0)
         self.overall_label.configure(text="—")
         self.file_label.configure(text="—")
+        #: Fraction of the overall bar already accounted for by finished jobs.
+        self._overall_done = 0.0
 
     def _overall(self, done: int, total: int, text: str) -> None:
-        self.overall_bar.configure(maximum=max(total, 1), value=done)
+        """Switch the overall bar to per-video mode («Видео N из M»)."""
+        self._overall_total_videos = max(total, 1)
+        self._overall_done = float(done)
+        self.overall_bar.configure(maximum=100.0)
+        self.overall_bar.configure(value=min(done / self._overall_total_videos * 100.0, 100.0))
         self.overall_label.configure(text=text)
 
     def _overall_complete(self) -> None:
-        maximum = float(self.overall_bar.cget("maximum") or 1)
-        self.overall_bar.configure(value=maximum)
+        self.overall_bar.configure(value=100.0)
         self.overall_label.configure(text="Завершено")
+        self.file_bar.configure(value=100.0)
         self.file_label.configure(text="Готово")
 
+    def _advance_overall(self, job: DownloadJob) -> None:
+        """Credit one fully processed video to the overall bar."""
+        total = getattr(self, "_overall_total_videos", job.videos_total) or 1
+        self._overall_done = min(self._overall_done + 1.0, float(total))
+        percent = self._overall_done / total * 100.0
+        self.overall_bar.configure(maximum=100.0, value=min(percent, 100.0))
+        self.overall_label.configure(
+            text=f"Видео {min(int(self._overall_done) + 1, total)} из {total}"
+        )
+
     def _file(self, percent: float, text: str, job: DownloadJob) -> None:
+        """Update the per-file bar and blend it into the overall bar.
+
+        ``percent`` is relative to the *current* file — for a chapter cut
+        that means the fragment itself (yt-dlp downloads only the requested
+        byte range), so the bar really shows the fragment's progress.  The
+        label additionally shows how many fragments of this video are done.
+        """
         self.file_bar.configure(value=max(0.0, min(percent, 100.0)))
         self.file_label.configure(text=text[:28])
         total_videos = max(job.videos_total, 1)
         step = 100.0 / total_videos
-        done = (job.position - 1) + percent / 100.0
-        self.overall_bar.configure(maximum=100.0, value=min(done * step, 100.0))
-        self.overall_label.configure(text=f"Видео {job.position} из {total_videos}")
+        base = getattr(self, "_overall_done", float(job.position - 1))
+        value = min((base + percent / 100.0) * step, 100.0)
+        self.overall_bar.configure(maximum=100.0, value=value)
+        if job.fragment is not None and job.fragments_of_video > 1:
+            caption = (
+                f"Видео {job.position} из {total_videos} · "
+                f"фрагмент {job.fragment_index}/{job.fragments_of_video}"
+            )
+        else:
+            caption = f"Видео {job.position} из {total_videos}"
+        self.overall_label.configure(text=caption[:40])
 
     # ==================================================================== close
     def _on_close(self) -> None:
