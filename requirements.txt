@@ -1,0 +1,3 @@
+# Runtime dependencies of the YouTube downloader GUI.
+# ffmpeg/ffprobe must additionally be installed and present in PATH.
+yt-dlp>=2024.4.9
