@@ -50,6 +50,8 @@ class Video:
     details_loaded: bool = False
     #: Resolutions offered by this video once its full metadata is known.
     available_heights: list[int] = field(default_factory=list)
+    #: Raw yt-dlp format table kept for building the selectable format list.
+    raw_formats: list[dict] = field(default_factory=list, repr=False)
 
     @property
     def watch_url(self) -> str:

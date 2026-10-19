@@ -31,7 +31,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from config import Config, load_config, save_config
 from downloader import DownloadJob, Downloader, check_ffmpeg, plan_jobs
-from extractor import ExtractError, Extractor, parse_url, validate_url
+from extractor import ExtractError, Extractor, build_format_list_from_video, parse_url, validate_url
 from models import FormatInfo, Fragment, Playlist, Video, format_timestamp
 from timestamp_parser import fragments_or_whole_video
 
@@ -320,12 +320,15 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", str(payload))
         elif kind == "fetch_done":
             assert isinstance(payload, tuple)
-            self._populate_tree(*payload)
+            # The fetch worker is finished — release the busy flag *before*
+            # filling the tree so follow-up lazy loads (description/formats)
+            # are not silently skipped by the "busy" guard.
             self._set_busy(False)
+            self._populate_tree(*payload)
         elif kind == "details_done":
             assert isinstance(payload, tuple)
-            self._apply_video_details(*payload)
             self._set_busy(False)
+            self._apply_video_details(*payload)
         elif kind == "video_progress":
             index, total, title = payload  # type: ignore[misc]
             self._overall(index - 1, total, f"Видео {index} из {total}")
@@ -402,10 +405,13 @@ class App(tk.Tk):
         """Fill the content tree and start loading details for one entry."""
         if playlist is not None:
             self.playlist = playlist
+            header_iid = f"playlist:{playlist.playlist_id}" if playlist.playlist_id else "playlist"
+            if self.tree.exists(header_iid):  # defensive: never clash on re-fill
+                header_iid = "playlist"
             header = self.tree.insert(
                 "",
                 "end",
-                iid="playlist",
+                iid=header_iid,
                 text=f"{_CHECK_ON} Плейлист: {playlist.title} ({playlist.count} видео)",
                 open=True,
             )
@@ -425,12 +431,20 @@ class App(tk.Tk):
             if target_iid is not None:
                 self.tree.focus(target_iid)
                 self.tree.see(target_iid)
-                if video is not None:
-                    # Its full metadata already arrived with the playlist page,
-                    # so only the format table still has to be requested.
-                    self._apply_video_details(target_iid, video, [])
-                    self._load_formats(target_iid, video)
+                if video is not None and target_iid == f"v:{video.video_id}":
+                    # Replace the flat entry with the fully-fetched object so
+                    # its description/formats drive the tree from now on.
+                    self._video_items[target_iid] = video
+                    if video.details_loaded:
+                        # Full metadata already arrived with the fetch —
+                        # publish chapters and formats without a new request.
+                        self._apply_video_details(
+                            target_iid, video, build_format_list_from_video(video)
+                        )
+                    else:
+                        self._load_details(target_iid)
                 else:
+                    # Flat playlist entries: load description + formats lazily.
                     self._load_details(target_iid)
         elif video is not None:
             self.single_video = video
@@ -438,17 +452,28 @@ class App(tk.Tk):
             label = video.title + (f"  [{format_timestamp(video.duration)}]" if video.duration else "")
             self.tree.insert("", "end", iid=iid, text=f"{_CHECK_ON} Видео: {label}", open=True)
             self._video_items[iid] = video
+            self._fragments_loaded.add(iid)
             self._apply_fragments(iid, video)
-            self._load_formats(iid, video)
+            if video.formats_loaded:
+                # Full metadata (incl. formats) already fetched by the
+                # extractor — publish it right away, no extra network call.
+                self._publish_formats(video, build_format_list_from_video(video))
+            else:
+                self._load_formats(iid, video)
             self.log(f"Отображено видео «{video.title}».")
         self._set_status("Данные получены, выберите содержимое и формат.")
 
     def _load_details(self, iid: str) -> None:
         """Fetch description/formats for one playlist entry (lazily, in a thread)."""
         video = self._video_items.get(iid)
-        if video is None or video.details_loaded or iid in self._fragments_loaded:
+        if video is None:
             return
         if self._busy:
+            return
+        if video.details_loaded and iid in self._fragments_loaded:
+            # Description already shown; only the format table may be missing.
+            if not self._formats and not video.formats_loaded:
+                self._load_formats(iid, video)
             return
         self._set_busy(True)
         self._set_status(f"Загружаю данные: {video.title}")
@@ -457,6 +482,8 @@ class App(tk.Tk):
     def _load_formats(self, iid: str, video: Video) -> None:
         """Request the format table of *video* when it is still unknown."""
         if self._formats or video.formats_loaded:
+            return
+        if self._busy:
             return
         self._set_busy(True)
         self._set_status(f"Загружаю форматы: {video.title}")

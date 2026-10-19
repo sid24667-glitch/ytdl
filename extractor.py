@@ -187,6 +187,15 @@ def _short_codec(codec: str) -> str:
     return codec.split(".")[0]
 
 
+def build_format_list_from_video(video: Video) -> list[FormatInfo]:
+    """Build the selectable format list from a video's cached raw table.
+
+    Used by the UI right after fetching so a single video shows its formats
+    immediately, without a second network request.
+    """
+    return build_format_list(video.raw_formats)
+
+
 class Extractor:
     """Fetch YouTube metadata through the yt-dlp Python API."""
 
@@ -254,6 +263,14 @@ class Extractor:
             highlighted: Video | None = None
             if video_id:
                 highlighted = next((v for v in playlist.videos if v.video_id == video_id), None)
+                if highlighted is not None and not highlighted.details_loaded:
+                    # Flat playlist pages never carry description/formats.
+                    # Fetch the concrete entry's full metadata once so the UI
+                    # can show its chapters and the format table immediately.
+                    try:
+                        highlighted = self._fetch_single_video(video_id)
+                    except ExtractError as exc:
+                        self._log(f"Не удалось получить полные данные видео: {exc}")
             return playlist, highlighted
 
         if info.get("_type") == "playlist":
@@ -262,11 +279,14 @@ class Extractor:
         return None, self._video_from_info(info, video_id or info.get("id", ""))
 
     def _fetch_single_video(self, video_id: str) -> Video:
-        """Fetch full metadata of one video (fallback path)."""
+        """Fetch full metadata of one video (fallback / highlighted entry)."""
         import yt_dlp
 
-        with yt_dlp.YoutubeDL(self._ydl_options()) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        try:
+            with yt_dlp.YoutubeDL(self._ydl_options()) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            raise ExtractError(f"Не удалось получить данные видео: {_first_line(str(exc))}") from exc
         if not info:
             raise ExtractError("YouTube вернул пустой ответ.")
         return self._video_from_info(info, video_id)
@@ -296,15 +316,17 @@ class Extractor:
 
     @staticmethod
     def _video_from_info(info: dict, video_id: str) -> Video:
+        raw_formats = list(info.get("formats") or [])
         return Video(
             video_id=str(info.get("id") or video_id),
             title=str(info.get("title") or "(без названия)"),
             duration=info.get("duration"),
             url=str(info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"),
             description=info.get("description") or "",
-            formats_loaded=bool(info.get("formats")),
+            formats_loaded=bool(raw_formats),
             details_loaded=True,
             available_heights=_available_heights(info),
+            raw_formats=raw_formats,
         )
 
     # ------------------------------------------------------------ lazy loads
@@ -327,7 +349,8 @@ class Extractor:
         video.url = info.get("webpage_url") or video.url
         video.details_loaded = True
         video.available_heights = _available_heights(info)
-        formats = build_format_list(info.get("formats") or [])
+        video.raw_formats = list(info.get("formats") or [])
+        formats = build_format_list(video.raw_formats)
         video.formats_loaded = bool(formats)
         return video, formats
 
